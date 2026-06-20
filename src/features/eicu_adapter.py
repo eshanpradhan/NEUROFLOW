@@ -16,18 +16,24 @@ Mapping notes
 -------------
   - eICU uses OFFSETS (minutes from unit admission); hour = floor(offset/60),
     window = first 63 hours.
-  - Vitals (vitalPeriodic): heartrate, systemicsystolic, systemicdiastolic,
-    sao2, respiration, temperature. eICU temperature is Celsius -> converted to
-    Fahrenheit to match MIMIC's channel (itemid 223761).
+  - Vitals: heartrate, BP, sao2, respiration, temperature. Blood pressure
+    combines invasive readings from vitalPeriodic (systemicsystolic/diastolic)
+    and non-invasive readings from vitalAperiodic (noninvasivesystolic/
+    diastolic) into the SAME sbp/dbp channels (both accumulate into the same
+    hourly mean). eICU temperature is Celsius -> converted to Fahrenheit.
   - RASS and GCS Total come from nurseCharting. eICU provides GCS Total directly
     (range 3-15), matching MIMIC's summed gcs_total channel.
   - Sedatives (infusionDrug): matched by generic + brand names; per-hour mean
-    infusion rate is used as the amt_* signal (eICU dose units differ from MIMIC;
-    this is an inherent external-validation domain shift). onboard_* uses the
-    same PK decay as MIMIC.
+    infusion rate is used as the amt_* signal, with physiologically plausible
+    per-drug rate caps applied. onboard_* uses the same PK decay as MIMIC.
   - Labels: label_dx (diagnosisstring contains 'delirium'), label_score (a
     positive nurse-charting delirium scale/score or assessment, per Rocheteau
     et al. 2021, ACM CHIL), label_combined = dx OR score.
+
+Imputation note: patients with zero real readings of a vital across their entire
+stay are filled with that channel's clinically neutral default (not 0.0, which
+clip_vital_channels would push to the lower bound and fabricate an extreme). The
+_mask channel still flags every such hour as not observed.
 
 Channel order is identical to build_timeseries.py so the model ingests the same
 inputs. Standardization is applied in evaluate.py using MIMIC-train statistics.
@@ -62,6 +68,7 @@ PROCESSED_DIR = PROJECT_ROOT / "data" / "processed"
 
 PATIENT_PATH = EICU_DIR / "patient.csv.gz"
 VITALPERIODIC_PATH = EICU_DIR / "vitalPeriodic.csv.gz"
+VITALAPERIODIC_PATH = EICU_DIR / "vitalAperiodic.csv.gz"
 NURSECHARTING_PATH = EICU_DIR / "nurseCharting.csv.gz"
 DIAGNOSIS_PATH = EICU_DIR / "diagnosis.csv.gz"
 INFUSIONDRUG_PATH = EICU_DIR / "infusionDrug.csv.gz"
@@ -74,6 +81,7 @@ ROLLING_WINDOW = 6
 MIN_ICU_HOURS = 24.0
 
 VITALPERIODIC_CHUNK = 3_000_000
+VITALAPERIODIC_CHUNK = 2_000_000
 NURSECHARTING_CHUNK = 3_000_000
 INFUSIONDRUG_CHUNK = 1_000_000
 DIAGNOSIS_CHUNK = 1_000_000
@@ -94,14 +102,21 @@ VLOW = np.array([v[1] for v in VITALS], dtype=np.float64)
 VHIGH = np.array([v[2] for v in VITALS], dtype=np.float64)
 N_VITALS = len(VITALS)
 
-# vitalPeriodic column -> (vital index, convert_C_to_F)
-VP_COLS = [
-    ("heartrate",          0, False),
-    ("systemicsystolic",   1, False),
-    ("systemicdiastolic",  2, False),
-    ("sao2",               3, False),
-    ("respiration",        4, False),
-    ("temperature",        5, True),
+# Clinically neutral default per vital (VITAL_NAMES order). Used ONLY for
+# patients with zero real readings of that vital across their entire stay, so
+# fully-missing patients receive a neutral value rather than 0.0 (which
+# clip_vital_channels would otherwise push up to the lower bound). The _mask
+# channel still flags every such hour as not observed.
+VITAL_NEUTRAL = np.array([80, 120, 70, 97, 18, 98.6, 0, 14], dtype=np.float64)
+
+# Simple directly-measured vitalPeriodic columns -> (vital index, convert_C_to_F).
+# Blood pressure (indices 1, 2) uses invasive systemic* here and non-invasive
+# readings are added separately from vitalAperiodic into the same channels.
+VP_SIMPLE = [
+    ("heartrate",   0, False),
+    ("sao2",        3, False),
+    ("respiration", 4, False),
+    ("temperature", 5, True),
 ]
 RASS_IDX = 6
 GCS_IDX = 7
@@ -118,6 +133,17 @@ SEDATIVE_NAMES = [s[0] for s in SEDATIVES]
 SEDATIVE_PATTERNS = [s[1] for s in SEDATIVES]
 SEDATIVE_HALFLIVES = np.array([s[2] for s in SEDATIVES], dtype=np.float64)
 N_SEDATIVES = len(SEDATIVES)
+
+# Physiologically plausible per-drug infusion-rate caps (absolute maxima),
+# aligned with SEDATIVES order: propofol, midazolam, dexmedetomidine,
+# lorazepam, fentanyl.
+SEDATIVE_RATE_CAPS = np.array([
+    500.0,   # propofol        (mcg/kg/min equivalent; absolute max)
+    50.0,    # midazolam        (mg/hr)
+    10.0,    # dexmedetomidine  (mcg/kg/hr equivalent; absolute max)
+    10.0,    # lorazepam        (mg/hr)
+    500.0,   # fentanyl         (mcg/hr)
+], dtype=np.float64)
 
 # Final channel order (identical to build_timeseries.py).
 CHANNELS = (
@@ -165,8 +191,11 @@ def bfill_rows(a: np.ndarray) -> np.ndarray:
 
 
 def impute_series(a: np.ndarray) -> np.ndarray:
-    out = bfill_rows(ffill_rows(a))
-    return np.nan_to_num(out, nan=0.0)
+    """Forward-fill then backward-fill along the time axis. Rows with zero
+    observations remain all-NaN so the caller can fill them with a clinically
+    neutral default (NOT 0.0, which clip_vital_channels would push to the lower
+    bound and fabricate an implausible extreme)."""
+    return bfill_rows(ffill_rows(a))
 
 
 def rolling_std(a: np.ndarray, window: int) -> np.ndarray:
@@ -211,8 +240,8 @@ def add_one(sum_acc, cnt_acc, vidx, s_idx, hour, val, low, high):
 # Stage steps
 # --------------------------------------------------------------------------- #
 def check_inputs() -> None:
-    needed = [PATIENT_PATH, VITALPERIODIC_PATH, NURSECHARTING_PATH,
-              DIAGNOSIS_PATH, INFUSIONDRUG_PATH]
+    needed = [PATIENT_PATH, VITALPERIODIC_PATH, VITALAPERIODIC_PATH,
+              NURSECHARTING_PATH, DIAGNOSIS_PATH, INFUSIONDRUG_PATH]
     missing = [p for p in needed if not p.exists()]
     if missing:
         print("[ERROR] Required eICU file(s) not found:")
@@ -277,8 +306,8 @@ def load_cohort():
 
 
 def accumulate_vitalperiodic(s_map, n_stays):
-    """Scan vitalPeriodic (chunked) for the 6 directly-measured vitals."""
-    step("Scanning vitalPeriodic (heartrate, BP, sao2, respiration, temp)")
+    """Scan vitalPeriodic (chunked) for the directly-measured vitals."""
+    step("Scanning vitalPeriodic (heartrate, invasive BP, sao2, resp, temp)")
     vit_sum = np.zeros((n_stays, N_VITALS, WINDOW_HOURS), dtype=np.float64)
     vit_cnt = np.zeros((n_stays, N_VITALS, WINDOW_HOURS), dtype=np.float64)
     n_scanned = n_kept = 0
@@ -300,15 +329,55 @@ def accumulate_vitalperiodic(s_map, n_stays):
         s_idx = s_idx[valid].to_numpy().astype(np.intp)
         off = pd.to_numeric(chunk["observationoffset"], errors="coerce").to_numpy()
         hour = np.floor(off / 60.0)
-        for col, vidx, conv in VP_COLS:
+
+        # Simple directly-measured vitals.
+        for col, vidx, conv in VP_SIMPLE:
             val = pd.to_numeric(chunk[col], errors="coerce").to_numpy()
             if conv:
                 val = val * 1.8 + 32.0
             n_kept += add_one(vit_sum, vit_cnt, vidx, s_idx, hour, val,
                               VLOW[vidx], VHIGH[vidx])
 
+        # Invasive blood pressure.
+        sbp = pd.to_numeric(chunk["systemicsystolic"], errors="coerce").to_numpy()
+        n_kept += add_one(vit_sum, vit_cnt, 1, s_idx, hour, sbp, VLOW[1], VHIGH[1])
+        dbp = pd.to_numeric(chunk["systemicdiastolic"], errors="coerce").to_numpy()
+        n_kept += add_one(vit_sum, vit_cnt, 2, s_idx, hour, dbp, VLOW[2], VHIGH[2])
+
     print(f"    vitalPeriodic rows scanned: {n_scanned:,}")
     print(f"    vital readings kept       : {n_kept:,}")
+    return vit_sum, vit_cnt
+
+
+def accumulate_vitalaperiodic(s_map, vit_sum, vit_cnt, n_stays):
+    """Scan vitalAperiodic (chunked) for non-invasive BP into sbp/dbp channels."""
+    step("Scanning vitalAperiodic (non-invasive BP -> sbp/dbp)")
+    n_scanned = n_kept = 0
+
+    reader = pd.read_csv(
+        VITALAPERIODIC_PATH, compression="gzip",
+        usecols=["patientunitstayid", "observationoffset",
+                 "noninvasivesystolic", "noninvasivediastolic"],
+        chunksize=VITALAPERIODIC_CHUNK,
+    )
+    for chunk in tqdm(reader, desc="    vitalAperiodic", unit="chunk"):
+        n_scanned += len(chunk)
+        s_idx = chunk["patientunitstayid"].map(s_map)
+        valid = s_idx.notna().to_numpy()
+        if not valid.any():
+            continue
+        chunk = chunk.loc[valid]
+        s_idx = s_idx[valid].to_numpy().astype(np.intp)
+        off = pd.to_numeric(chunk["observationoffset"], errors="coerce").to_numpy()
+        hour = np.floor(off / 60.0)
+
+        sbp = pd.to_numeric(chunk["noninvasivesystolic"], errors="coerce").to_numpy()
+        n_kept += add_one(vit_sum, vit_cnt, 1, s_idx, hour, sbp, VLOW[1], VHIGH[1])
+        dbp = pd.to_numeric(chunk["noninvasivediastolic"], errors="coerce").to_numpy()
+        n_kept += add_one(vit_sum, vit_cnt, 2, s_idx, hour, dbp, VLOW[2], VHIGH[2])
+
+    print(f"    vitalAperiodic rows scanned: {n_scanned:,}")
+    print(f"    NIBP readings kept         : {n_kept:,}")
     return vit_sum, vit_cnt
 
 
@@ -419,7 +488,7 @@ def load_delirium_diagnosis():
 
 def accumulate_infusiondrug(s_map, n_stays):
     """Scan infusionDrug (chunked) for sedative infusion rates (per-hour mean)."""
-    step("Scanning infusionDrug for sedatives (per-hour mean rate)")
+    step("Scanning infusionDrug for sedatives (per-hour mean rate, capped)")
     sed_sum = np.zeros((n_stays, N_SEDATIVES, WINDOW_HOURS), dtype=np.float64)
     sed_cnt = np.zeros((n_stays, N_SEDATIVES, WINDOW_HOURS), dtype=np.float64)
     n_scanned = n_events = 0
@@ -464,6 +533,8 @@ def accumulate_infusiondrug(s_map, n_stays):
         s2, d2 = s2[ok], d2[ok]
         hb = hour[ok].astype(np.intp)
         rr = rate[ok]
+        # Physiologically plausible per-drug rate caps.
+        rr = np.minimum(rr, SEDATIVE_RATE_CAPS[d2])
         n_events += int(ok.sum())
         np.add.at(sed_sum, (s2, d2, hb), rr)
         np.add.at(sed_cnt, (s2, d2, hb), 1.0)
@@ -486,6 +557,13 @@ def build_channels(vit_sum, vit_cnt, sed_sum, sed_cnt,
     filled = np.empty_like(means)
     for vi, name in enumerate(VITAL_NAMES):
         f = impute_series(means[:, vi, :])
+        # Patients with at least one real reading are fully ffill/bfill-imputed.
+        # Patients with ZERO real readings for this vital across their whole stay
+        # remain all-NaN here; fill them with the channel's clinically neutral
+        # default (NOT 0.0, which clip would push to the lower bound and
+        # fabricate an implausible extreme). The _mask channel still flags these
+        # hours as not observed.
+        f = np.where(np.isnan(f), VITAL_NEUTRAL[vi], f)
         filled[:, vi, :] = f
         channels[name] = f
         channels[f"{name}_mask"] = missing[:, vi, :].astype(np.float64)
@@ -519,6 +597,14 @@ def build_channels(vit_sum, vit_cnt, sed_sum, sed_cnt,
 
     hour_grid = np.arange(WINDOW_HOURS)[None, :]
     channels["pad"] = (hour_grid >= n_obs[:, None]).astype(np.float64)
+    return channels
+
+
+def clip_vital_channels(channels):
+    """Clip the 8 vital value channels to their plausible ranges (safety net,
+    matching the bounds used in build_timeseries.py)."""
+    for vi, name in enumerate(VITAL_NAMES):
+        channels[name] = np.clip(channels[name], VLOW[vi], VHIGH[vi])
     return channels
 
 
@@ -595,6 +681,10 @@ def print_summary(cohort, channels, n_stays):
     print("    - Same 32-channel order as MIMIC; apply MIMIC-train standardization")
     print("      in evaluate.py. Sedative units differ (rate vs amount) - expected")
     print("      external-validation domain shift.")
+    print("    - BP combines invasive (vitalPeriodic) + non-invasive")
+    print("      (vitalAperiodic) into the same sbp/dbp channels. Rates capped.")
+    print("    - Fully-missing vitals filled with clinically neutral defaults,")
+    print("      flagged via the mask channel (no fabricated extremes).")
     print("    - label_score uses explicit nurse-charting delirium scale/score")
     print("      assessments (Rocheteau et al. 2021, ACM CHIL).")
 
@@ -614,12 +704,14 @@ def main() -> None:
     los_hours = pat["los_hours"].to_numpy()
 
     vit_sum, vit_cnt = accumulate_vitalperiodic(s_map, n_stays)
+    vit_sum, vit_cnt = accumulate_vitalaperiodic(s_map, vit_sum, vit_cnt, n_stays)
     delirium_nc = accumulate_nursecharting(s_map, vit_sum, vit_cnt, n_stays)
     delirium = load_delirium_diagnosis()
     sed_sum, sed_cnt = accumulate_infusiondrug(s_map, n_stays)
 
     channels = build_channels(vit_sum, vit_cnt, sed_sum, sed_cnt,
                               n_obs, intime_hour, n_stays)
+    channels = clip_vital_channels(channels)
     del vit_sum, sed_sum
 
     cohort = write_cohort(stay_ids, los_hours, age, gender,
