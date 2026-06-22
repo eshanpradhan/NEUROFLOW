@@ -3,14 +3,14 @@
 NEUROFLOW - Stage 3: eICU Adapter (External Validation)
 =======================================================
 Converts eICU Collaborative Research Database v2.0 into the SAME 63-hour,
-32-channel time-series format produced by build_timeseries.py, plus an eICU
+40-channel time-series format produced by build_timeseries.py, plus an eICU
 cohort with delirium labels, so the MIMIC-trained model can be applied with NO
 retraining.
 
 Outputs
 -------
   data/processed/eicu_cohort.csv        (one row per ICU stay)
-  data/processed/eicu_timeseries.parquet (one row per stay x hour, 32 channels)
+  data/processed/eicu_timeseries.parquet (one row per stay x hour, 40 channels)
 
 Mapping notes
 -------------
@@ -19,24 +19,22 @@ Mapping notes
   - Vitals: heartrate, BP, sao2, respiration, temperature. Blood pressure
     combines invasive readings from vitalPeriodic (systemicsystolic/diastolic)
     and non-invasive readings from vitalAperiodic (noninvasivesystolic/
-    diastolic) into the SAME sbp/dbp channels (both accumulate into the same
-    hourly mean). eICU temperature is Celsius -> converted to Fahrenheit.
-  - RASS and GCS Total come from nurseCharting. eICU provides GCS Total directly
-    (range 3-15), matching MIMIC's summed gcs_total channel.
-  - Sedatives (infusionDrug): matched by generic + brand names; per-hour mean
-    infusion rate is used as the amt_* signal, with physiologically plausible
-    per-drug rate caps applied. onboard_* uses the same PK decay as MIMIC.
+    diastolic) into the SAME sbp/dbp channels. Temperature C -> F.
+  - Each vital has a _mask flag and a _hours_since channel (hours since the last
+    real observation; WINDOW_HOURS before the first-ever observation).
+  - RASS and GCS Total come from nurseCharting.
+  - Sedatives (infusionDrug): per-drug rate is capped, then integrated over time
+    (rate x active-duration) into an hourly cumulative AMOUNT, dimensionally
+    consistent with MIMIC's amount-based allocation. onboard_* uses MIMIC PK.
   - Labels: label_dx (diagnosisstring contains 'delirium'), label_score (a
-    positive nurse-charting delirium scale/score or assessment, per Rocheteau
+    positive nurse-charting delirium scale/score/assessment, per Rocheteau
     et al. 2021, ACM CHIL), label_combined = dx OR score.
 
 Imputation note: patients with zero real readings of a vital across their entire
-stay are filled with that channel's clinically neutral default (not 0.0, which
-clip_vital_channels would push to the lower bound and fabricate an extreme). The
+stay are filled with that channel's clinically neutral default (not 0.0). The
 _mask channel still flags every such hour as not observed.
 
-Channel order is identical to build_timeseries.py so the model ingests the same
-inputs. Standardization is applied in evaluate.py using MIMIC-train statistics.
+Channel order is identical to build_timeseries.py / tcn.py.
 
 DATA COMPLIANCE
 ---------------
@@ -102,16 +100,9 @@ VLOW = np.array([v[1] for v in VITALS], dtype=np.float64)
 VHIGH = np.array([v[2] for v in VITALS], dtype=np.float64)
 N_VITALS = len(VITALS)
 
-# Clinically neutral default per vital (VITAL_NAMES order). Used ONLY for
-# patients with zero real readings of that vital across their entire stay, so
-# fully-missing patients receive a neutral value rather than 0.0 (which
-# clip_vital_channels would otherwise push up to the lower bound). The _mask
-# channel still flags every such hour as not observed.
-VITAL_NEUTRAL = np.array([80, 120, 70, 97, 18, 98.6, 0, 14], dtype=np.float64)
-
+# Clinically neutral default per vital (VITAL_NAMES order) for fully-missing pts.
+VITAL_NEUTRAL = np.array([80, 120, 70, 97, 18, 98.6, -0.79, 14], dtype=np.float64)
 # Simple directly-measured vitalPeriodic columns -> (vital index, convert_C_to_F).
-# Blood pressure (indices 1, 2) uses invasive systemic* here and non-invasive
-# readings are added separately from vitalAperiodic into the same channels.
 VP_SIMPLE = [
     ("heartrate",   0, False),
     ("sao2",        3, False),
@@ -134,21 +125,15 @@ SEDATIVE_PATTERNS = [s[1] for s in SEDATIVES]
 SEDATIVE_HALFLIVES = np.array([s[2] for s in SEDATIVES], dtype=np.float64)
 N_SEDATIVES = len(SEDATIVES)
 
-# Physiologically plausible per-drug infusion-rate caps (absolute maxima),
-# aligned with SEDATIVES order: propofol, midazolam, dexmedetomidine,
-# lorazepam, fentanyl.
-SEDATIVE_RATE_CAPS = np.array([
-    500.0,   # propofol        (mcg/kg/min equivalent; absolute max)
-    50.0,    # midazolam        (mg/hr)
-    10.0,    # dexmedetomidine  (mcg/kg/hr equivalent; absolute max)
-    10.0,    # lorazepam        (mg/hr)
-    500.0,   # fentanyl         (mcg/hr)
-], dtype=np.float64)
+# Physiologically plausible per-drug infusion-rate caps, applied to the rate
+# BEFORE integration. Order: propofol, midazolam, dexmedetomidine, lorazepam,
+# fentanyl.
+SEDATIVE_RATE_CAPS = np.array([500.0, 50.0, 10.0, 10.0, 500.0], dtype=np.float64)
 
-# Final channel order (identical to build_timeseries.py).
+# Final channel order (identical to build_timeseries.py / tcn.py). 40 channels.
 CHANNELS = (
     VITAL_NAMES
-    + [f"{n}_mask" for n in VITAL_NAMES]
+    + [c for n in VITAL_NAMES for c in (f"{n}_mask", f"{n}_hours_since")]
     + ["hrv_proxy", "phys_instability", "charting_density"]
     + ["circadian_sin", "circadian_cos"]
     + [f"amt_{n}" for n in SEDATIVE_NAMES]
@@ -191,11 +176,32 @@ def bfill_rows(a: np.ndarray) -> np.ndarray:
 
 
 def impute_series(a: np.ndarray) -> np.ndarray:
-    """Forward-fill then backward-fill along the time axis. Rows with zero
-    observations remain all-NaN so the caller can fill them with a clinically
-    neutral default (NOT 0.0, which clip_vital_channels would push to the lower
-    bound and fabricate an implausible extreme)."""
+    """Forward-fill then backward-fill. Fully-missing rows remain all-NaN so the
+    caller can fill them with a clinically neutral default (NOT 0.0)."""
     return bfill_rows(ffill_rows(a))
+
+
+def hours_since_observed(missing: np.ndarray) -> np.ndarray:
+    """Hours since the vital was last actually observed, per hour.
+
+    missing: [N, T] (1/True = no observation that hour), from the _mask info and
+    BEFORE imputation. Reset to 0 at each real observation; +1 each subsequent
+    unobserved hour; WINDOW_HOURS before the first-ever observation.
+    """
+    missing = np.asarray(missing, dtype=bool)
+    n, t = missing.shape
+    observed = ~missing
+    out = np.empty((n, t), dtype=np.float64)
+    seen = np.zeros(n, dtype=bool)
+    prev = np.full(n, float(WINDOW_HOURS), dtype=np.float64)
+    for j in range(t):
+        obs_j = observed[:, j]
+        val = np.where(obs_j, 0.0,
+                       np.where(seen, prev + 1.0, float(WINDOW_HOURS)))
+        out[:, j] = val
+        prev = val
+        seen = seen | obs_j
+    return out
 
 
 def rolling_std(a: np.ndarray, window: int) -> np.ndarray:
@@ -330,7 +336,6 @@ def accumulate_vitalperiodic(s_map, n_stays):
         off = pd.to_numeric(chunk["observationoffset"], errors="coerce").to_numpy()
         hour = np.floor(off / 60.0)
 
-        # Simple directly-measured vitals.
         for col, vidx, conv in VP_SIMPLE:
             val = pd.to_numeric(chunk[col], errors="coerce").to_numpy()
             if conv:
@@ -338,7 +343,6 @@ def accumulate_vitalperiodic(s_map, n_stays):
             n_kept += add_one(vit_sum, vit_cnt, vidx, s_idx, hour, val,
                               VLOW[vidx], VHIGH[vidx])
 
-        # Invasive blood pressure.
         sbp = pd.to_numeric(chunk["systemicsystolic"], errors="coerce").to_numpy()
         n_kept += add_one(vit_sum, vit_cnt, 1, s_idx, hour, sbp, VLOW[1], VHIGH[1])
         dbp = pd.to_numeric(chunk["systemicdiastolic"], errors="coerce").to_numpy()
@@ -413,7 +417,6 @@ def accumulate_nursecharting(s_map, vit_sum, vit_cnt, n_stays):
         vallabel = chunk["nursingchartcelltypevallabel"].str.lower()
         value = chunk["nursingchartvalue"]
 
-        # --- RASS ---
         rass_m = (valname.str.contains("rass", na=False)
                   | vallabel.str.contains("rass", na=False)).to_numpy(dtype=bool)
         if rass_m.any():
@@ -422,7 +425,6 @@ def accumulate_nursecharting(s_map, vit_sum, vit_cnt, n_stays):
                               s_idx[rass_m], hour[rass_m], v,
                               VLOW[RASS_IDX], VHIGH[RASS_IDX])
 
-        # --- GCS Total ---
         gcs_m = (valname.str.contains("gcs", na=False)
                  & valname.str.contains("total", na=False)).to_numpy(dtype=bool)
         if gcs_m.any():
@@ -431,9 +433,6 @@ def accumulate_nursecharting(s_map, vit_sum, vit_cnt, n_stays):
                               s_idx[gcs_m], hour[gcs_m], v,
                               VLOW[GCS_IDX], VHIGH[GCS_IDX])
 
-        # --- Delirium scale/score (Rocheteau et al. 2021, ACM CHIL) ---
-        # cat=='scores' pre-filter; valname has 'delirium scale'/'delirium score'/
-        # 'delirium assessment'; vallabel has 'delirium scale/score'.
         cat = chunk["nursingchartcelltypecat"].str.strip().str.lower()
         is_scores = (cat == "scores").fillna(False).to_numpy(dtype=bool)
         delir_name = (
@@ -446,7 +445,6 @@ def accumulate_nursecharting(s_map, vit_sum, vit_cnt, n_stays):
         if delir_m.any():
             val_l = value.str.lower()
             val_num = pd.to_numeric(value, errors="coerce").to_numpy()
-            # Text positives (CAM-ICU style) OR ICDSC numeric score >= 4.
             positive = (
                 val_l.str.contains("yes", na=False).to_numpy(dtype=bool)
                 | val_l.str.contains("positive", na=False).to_numpy(dtype=bool)
@@ -487,10 +485,10 @@ def load_delirium_diagnosis():
 
 
 def accumulate_infusiondrug(s_map, n_stays):
-    """Scan infusionDrug (chunked) for sedative infusion rates (per-hour mean)."""
-    step("Scanning infusionDrug for sedatives (per-hour mean rate, capped)")
-    sed_sum = np.zeros((n_stays, N_SEDATIVES, WINDOW_HOURS), dtype=np.float64)
-    sed_cnt = np.zeros((n_stays, N_SEDATIVES, WINDOW_HOURS), dtype=np.float64)
+    """Scan infusionDrug (chunked); integrate capped rate x active-duration into
+    hourly cumulative sedative amounts (dimensionally like MIMIC's amounts)."""
+    step("Scanning infusionDrug for sedatives (rate x duration -> hourly amount)")
+    rec_s, rec_d, rec_off, rec_rate = [], [], [], []
     n_scanned = n_events = 0
 
     reader = pd.read_csv(
@@ -507,7 +505,7 @@ def accumulate_infusiondrug(s_map, n_stays):
         if not valid.any():
             continue
         chunk = chunk.loc[valid]
-        s_idx = s_idx[valid].to_numpy().astype(np.int64)
+        s_arr = s_idx[valid].to_numpy().astype(np.int64)
 
         name_l = chunk["drugname"].str.lower()
         d_idx = np.full(len(chunk), -1, dtype=np.int64)
@@ -518,35 +516,68 @@ def accumulate_infusiondrug(s_map, n_stays):
         if not keep.any():
             continue
 
-        s2 = s_idx[keep].astype(np.intp)
-        d2 = d_idx[keep].astype(np.intp)
+        s2 = s_arr[keep]
+        d2 = d_idx[keep]
         off = pd.to_numeric(chunk["infusionoffset"], errors="coerce").to_numpy()[keep]
-        hour = np.floor(off / 60.0)
-
         rate = pd.to_numeric(chunk["drugrate"], errors="coerce").to_numpy()[keep]
         inf = pd.to_numeric(chunk["infusionrate"], errors="coerce").to_numpy()[keep]
         rate = np.where(np.isnan(rate), inf, rate)
 
-        ok = (hour >= 0) & (hour < WINDOW_HOURS) & ~np.isnan(rate) & (rate > 0)
+        ok = ~np.isnan(off) & ~np.isnan(rate) & (rate > 0)
         if not ok.any():
             continue
-        s2, d2 = s2[ok], d2[ok]
-        hb = hour[ok].astype(np.intp)
-        rr = rate[ok]
-        # Physiologically plausible per-drug rate caps.
-        rr = np.minimum(rr, SEDATIVE_RATE_CAPS[d2])
+        s2, d2, off, rate = s2[ok], d2[ok], off[ok], rate[ok]
+        # Cap the rate BEFORE integration.
+        rate = np.minimum(rate, SEDATIVE_RATE_CAPS[d2])
+        rec_s.append(s2)
+        rec_d.append(d2)
+        rec_off.append(off)
+        rec_rate.append(rate)
         n_events += int(ok.sum())
-        np.add.at(sed_sum, (s2, d2, hb), rr)
-        np.add.at(sed_cnt, (s2, d2, hb), 1.0)
+
+    sed_amt = np.zeros((n_stays, N_SEDATIVES, WINDOW_HOURS), dtype=np.float64)
+    if rec_s:
+        s_all = np.concatenate(rec_s)
+        d_all = np.concatenate(rec_d)
+        off_all = np.concatenate(rec_off).astype(np.float64)
+        rate_all = np.concatenate(rec_rate).astype(np.float64)
+
+        # Sort by (stay, drug, offset) to find consecutive records per stay+drug.
+        order = np.lexsort((off_all, d_all, s_all))
+        s_all, d_all = s_all[order], d_all[order]
+        off_all, rate_all = off_all[order], rate_all[order]
+
+        next_off = np.full(s_all.shape, np.nan, dtype=np.float64)
+        same_group = (s_all[1:] == s_all[:-1]) & (d_all[1:] == d_all[:-1])
+        next_off[:-1] = np.where(same_group, off_all[1:], np.nan)
+        gap = next_off - off_all
+
+        # Duration (minutes): the gap if 0 < gap <= 60, else the remainder of the
+        # current hour bin (no next entry, or gap exceeds 60 min).
+        remainder = 60.0 - np.mod(off_all, 60.0)
+        valid_gap = (~np.isnan(gap)) & (gap > 0.0) & (gap <= 60.0)
+        duration = np.where(valid_gap, gap, remainder)
+        duration = np.clip(duration, 0.0, 60.0)
+
+        amount = rate_all * (duration / 60.0)
+        hour = np.floor(off_all / 60.0)
+        inwin = (hour >= 0) & (hour < WINDOW_HOURS)
+        if inwin.any():
+            np.add.at(
+                sed_amt,
+                (s_all[inwin].astype(np.intp),
+                 d_all[inwin].astype(np.intp),
+                 hour[inwin].astype(np.intp)),
+                amount[inwin],
+            )
 
     print(f"    infusionDrug rows scanned : {n_scanned:,}")
     print(f"    sedative records used     : {n_events:,}")
-    return sed_sum, sed_cnt
+    return sed_amt
 
 
-def build_channels(vit_sum, vit_cnt, sed_sum, sed_cnt,
-                   n_obs, intime_hour, n_stays):
-    step("Building channels (impute, derive, PK accumulation, circadian, pad)")
+def build_channels(vit_sum, vit_cnt, sed_amt, n_obs, intime_hour, n_stays):
+    step("Building channels (impute, time-delta, derive, PK, circadian, pad)")
     channels: dict[str, np.ndarray] = {}
 
     with np.errstate(divide="ignore", invalid="ignore"):
@@ -557,16 +588,14 @@ def build_channels(vit_sum, vit_cnt, sed_sum, sed_cnt,
     filled = np.empty_like(means)
     for vi, name in enumerate(VITAL_NAMES):
         f = impute_series(means[:, vi, :])
-        # Patients with at least one real reading are fully ffill/bfill-imputed.
-        # Patients with ZERO real readings for this vital across their whole stay
-        # remain all-NaN here; fill them with the channel's clinically neutral
-        # default (NOT 0.0, which clip would push to the lower bound and
-        # fabricate an implausible extreme). The _mask channel still flags these
-        # hours as not observed.
+        # Fully-missing patients are still all-NaN here; fill with the channel's
+        # clinically neutral default (NOT 0.0, which clip would push to the lower
+        # bound and fabricate an implausible extreme). The mask still flags them.
         f = np.where(np.isnan(f), VITAL_NEUTRAL[vi], f)
         filled[:, vi, :] = f
         channels[name] = f
         channels[f"{name}_mask"] = missing[:, vi, :].astype(np.float64)
+        channels[f"{name}_hours_since"] = hours_since_observed(missing[:, vi, :])
 
     hr = filled[:, VITAL_NAMES.index("heart_rate"), :]
     sbp = filled[:, VITAL_NAMES.index("sbp"), :]
@@ -580,12 +609,9 @@ def build_channels(vit_sum, vit_cnt, sed_sum, sed_cnt,
     channels["circadian_sin"] = np.sin(2.0 * np.pi * clock / 24.0)
     channels["circadian_cos"] = np.cos(2.0 * np.pi * clock / 24.0)
 
-    with np.errstate(divide="ignore", invalid="ignore"):
-        sed_mean = sed_sum / sed_cnt
-    sed_mean = np.nan_to_num(sed_mean, nan=0.0)
     decay = np.power(0.5, 1.0 / SEDATIVE_HALFLIVES)
     for di, name in enumerate(SEDATIVE_NAMES):
-        amt = sed_mean[:, di, :]
+        amt = sed_amt[:, di, :]
         channels[f"amt_{name}"] = amt
         onboard = np.zeros_like(amt)
         prev = np.zeros(n_stays, dtype=np.float64)
@@ -672,20 +698,21 @@ def print_summary(cohort, channels, n_stays):
         observed = int((channels[f"{name}_mask"] == 0).sum())
         print(f"    {name:<13} {pct(observed, total_cells)}")
     print()
-    print("  Sedative exposure (% of stay-hours with rate > 0):")
+    print("  Sedative exposure (% of stay-hours with amount > 0):")
     for name in SEDATIVE_NAMES:
         exposed = int((channels[f"amt_{name}"] > 0).sum())
         print(f"    {name:<16} {pct(exposed, total_cells)}")
     print()
     print("  Notes:")
-    print("    - Same 32-channel order as MIMIC; apply MIMIC-train standardization")
-    print("      in evaluate.py. Sedative units differ (rate vs amount) - expected")
-    print("      external-validation domain shift.")
+    print("    - 40 channels: each vital has _mask AND _hours_since. Same order")
+    print("      as MIMIC; apply MIMIC-train standardization in evaluate.py.")
     print("    - BP combines invasive (vitalPeriodic) + non-invasive")
-    print("      (vitalAperiodic) into the same sbp/dbp channels. Rates capped.")
+    print("      (vitalAperiodic) into the same sbp/dbp channels.")
+    print("    - Sedatives: capped rate x active-duration -> hourly amount")
+    print("      (dimensionally consistent with MIMIC inputevents amounts).")
     print("    - Fully-missing vitals filled with clinically neutral defaults,")
     print("      flagged via the mask channel (no fabricated extremes).")
-    print("    - label_score uses explicit nurse-charting delirium scale/score")
+    print("    - label_score uses nurse-charting delirium scale/score")
     print("      assessments (Rocheteau et al. 2021, ACM CHIL).")
 
 
@@ -707,12 +734,12 @@ def main() -> None:
     vit_sum, vit_cnt = accumulate_vitalaperiodic(s_map, vit_sum, vit_cnt, n_stays)
     delirium_nc = accumulate_nursecharting(s_map, vit_sum, vit_cnt, n_stays)
     delirium = load_delirium_diagnosis()
-    sed_sum, sed_cnt = accumulate_infusiondrug(s_map, n_stays)
+    sed_amt = accumulate_infusiondrug(s_map, n_stays)
 
-    channels = build_channels(vit_sum, vit_cnt, sed_sum, sed_cnt,
+    channels = build_channels(vit_sum, vit_cnt, sed_amt,
                               n_obs, intime_hour, n_stays)
     channels = clip_vital_channels(channels)
-    del vit_sum, sed_sum
+    del vit_sum, sed_amt
 
     cohort = write_cohort(stay_ids, los_hours, age, gender,
                           delirium, delirium_nc)

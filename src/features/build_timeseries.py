@@ -13,16 +13,18 @@ For each ICU stay, hour t = 0..62 covers [intime + t h, intime + (t+1) h).
 Stays >= 63 h use their first 63 h fully; shorter stays are right-padded and the
 `pad` channel marks beyond-discharge hours. (Cohort already requires >= 24 h.)
 
-Channels (32 total, fixed order)
+Channels (40 total, fixed order)
 --------------------------------
   vitals (8)            : heart_rate, sbp, dbp, spo2, resp_rate, temperature,
                           rass, gcs_total            (hourly mean, imputed)
-  vitals missingness(8) : <vital>_mask  (1 = no measurement that hour)
+  per vital, interleaved:
+      <vital>_mask          (1 = no measurement that hour)
+      <vital>_hours_since   (hours since last real observation; WINDOW_HOURS
+                             before the first-ever observation)
   derived (3)           : hrv_proxy            (rolling SD of HR - autonomic)
                           phys_instability     (rolling SD of HR/SBP/RR composite)
                           charting_density     (monitored-item readings / hour)
-  circadian (2)         : circadian_sin, circadian_cos  (time-of-day; preserved
-                          under MIMIC date shifting)
+  circadian (2)         : circadian_sin, circadian_cos
   sedatives amount (5)  : amt_<drug>   (hourly dose, infusion intervals allocated)
   sedatives onboard (5) : onboard_<drug>  (PK exponential-decay accumulation)
   pad (1)               : pad          (1 = hour beyond ICU discharge)
@@ -30,8 +32,7 @@ Channels (32 total, fixed order)
 gcs_total is the true Glasgow Coma Scale: the sum of the three component
 itemids (eye 220739 [1-4], verbal 223900 [1-5], motor 223901 [1-6]), range
 [3,15]. An hour's gcs_total is observed only when all three components are
-present; otherwise its mask is 1 and the value is ffill/bfill-imputed like the
-other vitals.
+present; otherwise its mask is 1 and the value is ffill/bfill-imputed.
 
 Antipsychotics (haloperidol/quetiapine/olanzapine) are NOT features here - they
 define the proxy label, so using them would leak the target.
@@ -96,7 +97,7 @@ SIMPLE_HIGH = np.array([v[3] for v in SIMPLE_VITALS], dtype=np.float64)
 N_SIMPLE = len(SIMPLE_VITALS)
 
 # GCS components: summed to form gcs_total (range [3,15]).
-# (name, itemid, component_low, component_high). Order is fixed: eye, verbal, motor.
+# (name, itemid, component_low, component_high). Order: eye, verbal, motor.
 GCS_COMPONENTS = [
     ("gcs_eye",    220739, 1, 4),
     ("gcs_verbal", 223900, 1, 5),
@@ -126,10 +127,10 @@ SEDATIVE_ITEMID_TO_IDX = {s[1]: i for i, s in enumerate(SEDATIVES)}
 SEDATIVE_HALFLIVES = np.array([s[2] for s in SEDATIVES], dtype=np.float64)
 N_SEDATIVES = len(SEDATIVES)
 
-# Final channel order (must match the columns written to parquet).
+# Final channel order (must match eicu_adapter.py and tcn.py). 40 channels.
 CHANNELS = (
     VITAL_NAMES
-    + [f"{n}_mask" for n in VITAL_NAMES]
+    + [c for n in VITAL_NAMES for c in (f"{n}_mask", f"{n}_hours_since")]
     + ["hrv_proxy", "phys_instability", "charting_density"]
     + ["circadian_sin", "circadian_cos"]
     + [f"amt_{n}" for n in SEDATIVE_NAMES]
@@ -173,6 +174,30 @@ def impute_series(a: np.ndarray) -> np.ndarray:
     """Forward-fill, then backward-fill, then zero any all-missing rows."""
     out = bfill_rows(ffill_rows(a))
     return np.nan_to_num(out, nan=0.0)
+
+
+def hours_since_observed(missing: np.ndarray) -> np.ndarray:
+    """Hours since the vital was last actually observed, per hour.
+
+    missing: [N, T] (1/True = no observation that hour). Computed from the same
+    mask used for the _mask channels, BEFORE imputation. At a real observation
+    the value resets to 0; each subsequent unobserved hour increments by 1;
+    hours before the first-ever observation use WINDOW_HOURS.
+    """
+    missing = np.asarray(missing, dtype=bool)
+    n, t = missing.shape
+    observed = ~missing
+    out = np.empty((n, t), dtype=np.float64)
+    seen = np.zeros(n, dtype=bool)
+    prev = np.full(n, float(WINDOW_HOURS), dtype=np.float64)
+    for j in range(t):
+        obs_j = observed[:, j]
+        val = np.where(obs_j, 0.0,
+                       np.where(seen, prev + 1.0, float(WINDOW_HOURS)))
+        out[:, j] = val
+        prev = val
+        seen = seen | obs_j
+    return out
 
 
 def rolling_std(a: np.ndarray, window: int) -> np.ndarray:
@@ -236,7 +261,6 @@ def load_cohort():
     s_map = pd.Series(np.arange(s, dtype=np.int64), index=cohort["stay_id"])
     intime_map = pd.Series(cohort["intime"].to_numpy(), index=cohort["stay_id"])
 
-    # Observed-hour count and per-stay clock hour at intime (for pad / circadian).
     n_obs = np.minimum(
         WINDOW_HOURS,
         np.ceil(cohort["los_hours"].to_numpy()).astype(np.int64),
@@ -325,7 +349,6 @@ def _allocate_intervals(sed_amt, s_idx, d_idx, start_h, end_h, amount):
     dur = end_h - start_h
     is_inf = dur > 0.0
 
-    # Bolus / zero-duration events: assign full amount to the start bin.
     bol = ~is_inf
     if bol.any():
         bt = np.floor(start_h[bol]).astype(np.int64)
@@ -339,7 +362,6 @@ def _allocate_intervals(sed_amt, s_idx, d_idx, start_h, end_h, amount):
                 amount[bol][valid],
             )
 
-    # Infusions: distribute amount proportional to per-bin time overlap.
     if is_inf.any():
         s2 = s_idx[is_inf].astype(np.intp)
         d2 = d_idx[is_inf].astype(np.intp)
@@ -392,13 +414,11 @@ def accumulate_inputevents(s_map, intime_map, n_stays):
         start_h = (chunk["starttime"].to_numpy() - intime) / np.timedelta64(1, "h")
         end_arr = chunk["endtime"].to_numpy()
         end_h = (end_arr - intime) / np.timedelta64(1, "h")
-        # Missing endtime -> treat as instantaneous bolus at starttime.
         end_h = np.where(np.isnan(end_h), start_h, end_h)
 
         d_idx = chunk["itemid"].map(SEDATIVE_ITEMID_TO_IDX).to_numpy().astype(np.int64)
         amount = chunk["amount"].to_numpy()
 
-        # Keep only events overlapping the [0, WINDOW_HOURS) window.
         overlaps = (end_h > 0) & (start_h < WINDOW_HOURS)
         if not overlaps.any():
             continue
@@ -415,11 +435,11 @@ def accumulate_inputevents(s_map, intime_map, n_stays):
 
 def build_channels(simp_sum, simp_cnt, gcs_sum, gcs_cnt, sed_amt,
                    n_obs, intime_hour, n_stays):
-    """Assemble the 32 channels as [n_stays, WINDOW_HOURS] float arrays."""
-    step("Building channels (impute, derive, PK accumulation, circadian, pad)")
+    """Assemble the 40 channels as [n_stays, WINDOW_HOURS] float arrays."""
+    step("Building channels (impute, time-delta, derive, PK, circadian, pad)")
     channels: dict[str, np.ndarray] = {}
 
-    # --- Simple vitals: hourly mean + missingness flag ---
+    # --- Simple vitals: hourly mean + missingness flag + hours-since ---
     with np.errstate(divide="ignore", invalid="ignore"):
         simp_mean = simp_sum / simp_cnt
     simp_mean[simp_cnt == 0] = np.nan
@@ -431,6 +451,7 @@ def build_channels(simp_sum, simp_cnt, gcs_sum, gcs_cnt, sed_amt,
         filled_simple[:, vi, :] = f
         channels[name] = f
         channels[f"{name}_mask"] = simp_missing[:, vi, :].astype(np.float64)
+        channels[f"{name}_hours_since"] = hours_since_observed(simp_missing[:, vi, :])
 
     # --- gcs_total: sum of three component means (NaN if any missing) ---
     with np.errstate(divide="ignore", invalid="ignore"):
@@ -440,6 +461,7 @@ def build_channels(simp_sum, simp_cnt, gcs_sum, gcs_cnt, sed_amt,
     gcs_total_mask = np.isnan(gcs_total_raw)
     channels["gcs_total"] = impute_series(gcs_total_raw)
     channels["gcs_total_mask"] = gcs_total_mask.astype(np.float64)
+    channels["gcs_total_hours_since"] = hours_since_observed(gcs_total_mask)
 
     # --- Derived physiological features (computed on imputed signals) ---
     hr = filled_simple[:, SIMPLE_NAMES.index("heart_rate"), :]
@@ -457,7 +479,7 @@ def build_channels(simp_sum, simp_cnt, gcs_sum, gcs_cnt, sed_amt,
     channels["circadian_cos"] = np.cos(2.0 * np.pi * clock / 24.0)
 
     # --- Sedatives: hourly amount + PK onboard (exponential decay) ---
-    decay = np.power(0.5, 1.0 / SEDATIVE_HALFLIVES)  # per-hour retention factor
+    decay = np.power(0.5, 1.0 / SEDATIVE_HALFLIVES)
     for di, name in enumerate(SEDATIVE_NAMES):
         amt = sed_amt[:, di, :]
         channels[f"amt_{name}"] = amt
@@ -518,11 +540,12 @@ def print_summary(channels, n_stays):
         print(f"    {name:<16} {100.0 * exposed / total_cells:6.2f}%")
     print()
     print("  Notes:")
-    print("    - gcs_total is the summed GCS (eye+verbal+motor); an hour is")
-    print("      observed only when all three components are present.")
+    print("    - 40 channels: each vital now has _mask AND _hours_since (time")
+    print("      since last real observation; WINDOW_HOURS before first obs).")
+    print("    - gcs_total is summed GCS (eye+verbal+motor); observed only when")
+    print("      all three components are present.")
     print("    - Values are raw + imputed (ffill/bfill); standardize in train.py")
-    print("      on the train split only. Use *_mask and pad as model inputs.")
-    print("    - Join labels/split from cohort.csv on stay_id for training.")
+    print("      on the train split only. Join labels/split from cohort.csv.")
 
 
 # --------------------------------------------------------------------------- #
@@ -542,7 +565,6 @@ def main() -> None:
     channels = build_channels(simp_sum, simp_cnt, gcs_sum, gcs_cnt, sed_amt,
                               n_obs, intime_hour, n_stays)
 
-    # Free large sum buffers before writing.
     del simp_sum, gcs_sum
 
     write_parquet(channels, stay_ids, n_stays)
