@@ -11,6 +11,11 @@ Reads (Observation, MedicationAdministration, Encounter, Patient) build the
 calibrated predictions and ABCDEF-bundle compliance tracking back into the
 patient's FHIR timeline, encounter-scoped and auditable.
 
+RiskAssessment writeback uses deterministic UUIDv5 IDs keyed on
+(encounter_id, hour_bucket) so each hourly inference cycle performs an
+idempotent PUT rather than creating a new resource — one clean RiskAssessment
+per encounter per hour, no database pollution.
+
 Run (self-test against a running HAPI server):
     source /Users/eshanpradhan/Desktop/NEUROFLOW/.venv/bin/activate
     python src/fhir/fhir_client.py
@@ -19,6 +24,7 @@ Run (self-test against a running HAPI server):
 from __future__ import annotations
 
 import json
+import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
@@ -42,6 +48,9 @@ USCORE_RISKASSESSMENT = (
 USCORE_CAREPLAN = (
     "http://hl7.org/fhir/us/core/StructureDefinition/us-core-careplan"
 )
+
+# UUIDv5 namespace for deterministic NEUROFLOW resource IDs.
+_NEUROFLOW_NS = uuid.UUID("6ba7b810-9dad-11d1-80b4-00c04fd430c8")
 
 # LOINC codes for the 8 vital channels (model channel order).
 VITAL_LOINC = {
@@ -126,6 +135,22 @@ def confidence_tier_for_width(width: float) -> str:
     return "low"
 
 
+def deterministic_risk_assessment_id(encounter_id: str,
+                                     hour_bucket: Optional[str] = None) -> str:
+    """UUIDv5 deterministic RiskAssessment ID.
+
+    Keyed on (encounter_id, hour_bucket) so each hourly inference cycle
+    produces the same logical ID — enabling idempotent PUT upserts instead
+    of creating duplicate resources.
+
+    hour_bucket defaults to the current UTC hour (e.g. '2026-06-23T14:00:00Z').
+    """
+    if hour_bucket is None:
+        hour_bucket = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:00:00Z")
+    key = f"neuroflow|{encounter_id}|{hour_bucket}"
+    return str(uuid.uuid5(_NEUROFLOW_NS, key))
+
+
 # --------------------------------------------------------------------------- #
 # FHIR client
 # --------------------------------------------------------------------------- #
@@ -165,6 +190,17 @@ class FHIRClient:
         if r.status_code not in (200, 201):
             raise FHIRError(r.status_code, r.text,
                             context=f"POST {resource_type}")
+        return r.json()
+
+    def _put(self, path: str, body: dict) -> dict:
+        """Idempotent PUT — creates or fully replaces the resource at path."""
+        try:
+            r = self.session.put(self._url(path),
+                                 data=json.dumps(body), timeout=self.timeout)
+        except requests.RequestException as e:
+            raise FHIRError(0, str(e), context=f"PUT {path}")
+        if r.status_code not in (200, 201):
+            raise FHIRError(r.status_code, r.text, context=f"PUT {path}")
         return r.json()
 
     def capability(self) -> dict:
@@ -256,18 +292,28 @@ class FHIRClient:
         meds.sort(key=_eff)
         return meds
 
-    # ----- WRITE: RiskAssessment ----- #
+    # ----- WRITE: RiskAssessment (idempotent PUT with deterministic ID) ----- #
     def write_risk_assessment(self, patient_id: str, encounter_id: str,
                               probability: float, interval_low: float,
                               interval_high: float,
                               confidence_tier: Optional[str] = None,
-                              model_version: str = "neuroflow-tcn-v1") -> str:
+                              model_version: str = "neuroflow-tcn-v1",
+                              hour_bucket: Optional[str] = None) -> str:
+        """Write (or update) a RiskAssessment using a deterministic UUIDv5 ID.
+
+        The same encounter + hour always maps to the same resource ID, so
+        repeated calls within the same hour perform an idempotent upsert
+        (PUT) rather than creating duplicate resources.
+        """
         prob = float(max(0.0, min(1.0, probability)))
         low = float(max(0.0, min(1.0, interval_low)))
         high = float(max(0.0, min(1.0, interval_high)))
         width = max(0.0, high - low)
         tier = confidence_tier or confidence_tier_for_width(width)
         now = fhir_now()
+
+        # Deterministic ID: one RiskAssessment per encounter per hour.
+        resource_id = deterministic_risk_assessment_id(encounter_id, hour_bucket)
 
         prediction = {
             "outcome": {
@@ -302,6 +348,7 @@ class FHIRClient:
 
         resource = {
             "resourceType": "RiskAssessment",
+            "id": resource_id,
             "meta": {"profile": [USCORE_RISKASSESSMENT]},
             "status": "final",
             "code": {
@@ -323,8 +370,10 @@ class FHIRClient:
             "prediction": [prediction],
             "note": [{"text": note_text}],
         }
-        created = self._post("RiskAssessment", resource)
-        return created.get("id", "")
+
+        # PUT for idempotent upsert — same ID within the same hour.
+        created = self._put(f"RiskAssessment/{resource_id}", resource)
+        return created.get("id", resource_id)
 
     # ----- WRITE: continuous risk Observation (dashboard signal) ----- #
     def write_risk_observation(self, patient_id: str, encounter_id: str,
@@ -471,6 +520,16 @@ def _self_test() -> None:
     print("=" * 70)
     client = FHIRClient()
 
+    # Verify deterministic ID logic.
+    id1 = deterministic_risk_assessment_id("enc-001", "2026-06-23T14:00:00Z")
+    id2 = deterministic_risk_assessment_id("enc-001", "2026-06-23T14:00:00Z")
+    id3 = deterministic_risk_assessment_id("enc-001", "2026-06-23T15:00:00Z")
+    assert id1 == id2, "Same encounter+hour must produce same ID"
+    assert id1 != id3, "Different hours must produce different IDs"
+    print(f"  deterministic ID check : passed")
+    print(f"    enc-001 @ 14:00 -> {id1}")
+    print(f"    enc-001 @ 15:00 -> {id3}")
+
     try:
         cap = client.capability()
         print(f"  server reachable       : yes")
@@ -485,7 +544,6 @@ def _self_test() -> None:
         _offline_checks()
         return
 
-    # Live checks: list active encounters; round-trip a write if one exists.
     try:
         encs = client.get_active_encounters()
         print(f"  active encounters      : {len(encs)}")
@@ -509,10 +567,20 @@ def _self_test() -> None:
             except FHIRError as e:
                 print(f"    [WARN] read failed: {e}")
             try:
-                ra_id = client.write_risk_assessment(
+                # Write twice with same hour_bucket — second should be a
+                # silent upsert, not a new resource.
+                bucket = "2026-06-23T14:00:00Z"
+                ra_id_1 = client.write_risk_assessment(
                     pat_id, enc_id, probability=0.72,
-                    interval_low=0.61, interval_high=0.83)
-                print(f"    wrote RiskAssessment : {ra_id}")
+                    interval_low=0.61, interval_high=0.83,
+                    hour_bucket=bucket)
+                ra_id_2 = client.write_risk_assessment(
+                    pat_id, enc_id, probability=0.74,
+                    interval_low=0.63, interval_high=0.85,
+                    hour_bucket=bucket)
+                assert ra_id_1 == ra_id_2, "Idempotent upsert failed"
+                print(f"    wrote RiskAssessment : {ra_id_1}")
+                print(f"    idempotent upsert    : confirmed (same ID both calls)")
                 cp_id = client.create_abcdef_careplan(pat_id, enc_id, 0.72)
                 print(f"    wrote CarePlan       : {cp_id}")
                 comp = client.score_abcdef_compliance(pat_id, enc_id, cp_id)
@@ -538,8 +606,11 @@ def _offline_checks() -> None:
     assert confidence_tier_for_width(0.20) == "moderate"
     assert confidence_tier_for_width(0.40) == "low"
     assert fhir_now().endswith("Z")
+    id1 = deterministic_risk_assessment_id("enc-001", "2026-06-23T14:00:00Z")
+    id2 = deterministic_risk_assessment_id("enc-001", "2026-06-23T14:00:00Z")
+    assert id1 == id2
     print("  offline helper checks  : passed "
-          "(references, confidence tiers, timestamp)")
+          "(references, confidence tiers, timestamp, deterministic IDs)")
 
 
 if __name__ == "__main__":
