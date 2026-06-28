@@ -39,7 +39,7 @@ from fhir.inference_loop import NeuroflowInference, run_once  # noqa: E402
 # Theme
 # --------------------------------------------------------------------------- #
 BASE_URL = "http://localhost:8080/fhir"
-THRESHOLD = 0.3
+THRESHOLD = 0.5
 WINDOW_HOURS = 63
 
 BG = "#0a1628"
@@ -53,7 +53,7 @@ YELLOW = "#f1c40f"
 RED = "#e74c3c"
 GRID = "rgba(138,160,184,0.15)"
 
-FONT = "'Segoe UI', 'Helvetica Neue', Arial, sans-serif"
+FONT = "'Inter', 'Segoe UI', 'Helvetica Neue', Arial, sans-serif"
 
 
 def risk_color(p: float) -> str:
@@ -225,7 +225,7 @@ def trajectory_figure(points, current) -> go.Figure:
                  f"{current['prob']:.2f} ({current['tier']} confidence)")
 
     fig.update_layout(
-        title=dict(text=title, font=dict(color=TEXT, size=18)),
+        title=dict(text=title, font=dict(color=TEXT, size=18, family=FONT)),
         paper_bgcolor=PANEL, plot_bgcolor=PANEL, font=dict(color=TEXT, family=FONT),
         height=440, margin=dict(l=55, r=25, t=60, b=50),
         showlegend=True,
@@ -255,7 +255,7 @@ def abcdef_panel(compliance: dict):
         color = GREEN if ok else RED
         status = "DOCUMENTED" if ok else "NOT DOCUMENTED"
         boxes.append(html.Div([
-            html.Div(key, style={"fontSize": "26px", "fontWeight": "700",
+            html.Div(key, style={"fontSize": "32px", "fontWeight": "700",
                                  "color": color}),
             html.Div(ABCDEF_TITLES[key], style={"fontSize": "11px",
                                                  "color": TEXT,
@@ -269,8 +269,9 @@ def abcdef_panel(compliance: dict):
                                     "fontWeight": "700", "marginTop": "6px"}),
         ], style={
             "flex": "1", "minWidth": "150px", "backgroundColor": PANEL_LIGHT,
-            "border": f"1px solid {color}", "borderRadius": "8px",
-            "padding": "12px", "margin": "5px",
+            "border": f"1px solid {color}", "borderTop": f"3px solid {color}",
+            "borderRadius": "8px", "padding": "16px", "margin": "5px",
+            "boxShadow": "0 2px 8px rgba(0,0,0,0.3)",
         }))
 
     overall = html.Div(
@@ -283,14 +284,15 @@ def abcdef_panel(compliance: dict):
 
 def stat_row(label, value, value_color=TEXT, big=False):
     return html.Div([
-        html.Div(label, style={"color": MUTED, "fontSize": "11px",
+        html.Div(label, style={"color": MUTED, "fontSize": "10px",
                                "textTransform": "uppercase",
-                               "letterSpacing": "0.5px"}),
+                               "letterSpacing": "1px"}),
         html.Div(value, style={"color": value_color,
-                               "fontSize": "30px" if big else "15px",
+                               "fontSize": "42px" if big else "15px",
                                "fontWeight": "700" if big else "500",
                                "marginTop": "2px"}),
-    ], style={"marginBottom": "14px"})
+    ], style={"marginBottom": "14px", "paddingBottom": "10px",
+              "borderBottom": "1px solid rgba(138,160,184,0.1)"})
 
 
 def sidebar_panel(current):
@@ -325,11 +327,13 @@ def sidebar_panel(current):
 # --------------------------------------------------------------------------- #
 # App
 # --------------------------------------------------------------------------- #
-app = Dash(__name__, title="NEUROFLOW ICU Delirium Monitor")
+app = Dash(__name__, title="NEUROFLOW ICU Delirium Monitor",
+           external_stylesheets=["https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&display=swap"])
 server = app.server
 
-CARD = {"backgroundColor": PANEL, "borderRadius": "10px", "padding": "18px",
-        "border": f"1px solid {PANEL_LIGHT}"}
+CARD = {"backgroundColor": PANEL, "borderRadius": "10px", "padding": "20px",
+        "border": f"1px solid {PANEL_LIGHT}",
+        "borderTop": f"3px solid {ACCENT}"}
 
 app.layout = html.Div([
     html.Div([
@@ -337,9 +341,18 @@ app.layout = html.Div([
             html.Span("NEURO", style={"color": "white", "fontWeight": "800"}),
             html.Span("FLOW", style={"color": ACCENT, "fontWeight": "800"}),
         ], style={"fontSize": "26px", "letterSpacing": "1px"}),
-        html.Div("FHIR-native ICU Delirium Prediction",
-                 style={"color": MUTED, "fontSize": "13px"}),
-    ], style={"marginBottom": "16px"}),
+        html.Div([
+            html.Span("FHIR-native ICU Delirium Prediction",
+                      style={"color": MUTED, "fontSize": "13px"}),
+            html.Span("AMIA 2026 FHIR App Competition", style={
+                "color": ACCENT, "fontSize": "10px", "fontWeight": "600",
+                "backgroundColor": PANEL_LIGHT, "padding": "3px 10px",
+                "borderRadius": "10px", "marginLeft": "12px",
+                "letterSpacing": "0.5px"}),
+        ], style={"marginTop": "4px", "display": "flex",
+                  "alignItems": "center"}),
+    ], style={"marginBottom": "16px", "borderLeft": f"4px solid {ACCENT}",
+              "paddingLeft": "14px"}),
 
     html.Div([
         html.Div([
@@ -352,9 +365,11 @@ app.layout = html.Div([
         ], style={"flex": "1", "marginRight": "12px"}),
         html.Button("REFRESH / RUN INFERENCE", id="refresh-btn", n_clicks=0,
                     style={"backgroundColor": ACCENT, "color": "#04101f",
-                           "border": "none", "borderRadius": "8px",
-                           "padding": "10px 18px", "fontWeight": "700",
-                           "cursor": "pointer", "alignSelf": "flex-end"}),
+                           "border": "none", "borderRadius": "6px",
+                           "padding": "12px 24px", "fontWeight": "700",
+                           "cursor": "pointer", "alignSelf": "flex-end",
+                           "boxShadow": "0 2px 12px rgba(0,212,255,0.3)",
+                           "transition": "all 0.2s ease"}),
     ], style={"display": "flex", "alignItems": "flex-end",
               "marginBottom": "8px"}),
 
@@ -373,6 +388,13 @@ app.layout = html.Div([
         html.Div(id="sidebar", style={**CARD, "flex": "1", "minWidth": "240px"}),
     ], style={"display": "flex", "alignItems": "flex-start"}),
 
+    html.Div("NEUROFLOW \u00b7 MIMIC-IV v3.1 \u00b7 eICU v2.0 \u00b7 HAPI FHIR R4 "
+             "\u00b7 AMIA/HL7 FHIR App Competition 2026",
+             style={"color": "rgba(138,160,184,0.4)", "fontSize": "10px",
+                    "textAlign": "center", "marginTop": "24px",
+                    "borderTop": "1px solid rgba(138,160,184,0.1)",
+                    "paddingTop": "12px"}),
+
     dcc.Store(id="current-store"),
 ], style={"backgroundColor": BG, "minHeight": "100vh", "padding": "22px 28px",
           "fontFamily": FONT})
@@ -386,16 +408,22 @@ app.layout = html.Div([
     Output("abcdef-panel", "children"),
     Output("sidebar", "children"),
     Output("status-line", "children"),
+    Output("status-line", "style"),
     Input("encounter-dropdown", "value"),
     Input("refresh-btn", "n_clicks"),
     prevent_initial_call=True,
 )
 def update_dashboard(selection, n_clicks):
+    base_status_style = {"color": MUTED, "fontSize": "12px",
+                         "marginBottom": "14px", "minHeight": "16px"}
+    active_status_style = {**base_status_style, "borderLeft": f"3px solid {ACCENT}",
+                           "paddingLeft": "10px"}
+
     if not selection:
         return (empty_fig("Select an encounter to begin."),
                 html.Div("No encounter selected.", style={"color": MUTED}),
                 html.Div("No encounter selected.", style={"color": MUTED}),
-                "")
+                "", base_status_style)
 
     pat_id, enc_id = selection.split("|", 1)
 
@@ -403,7 +431,8 @@ def update_dashboard(selection, n_clicks):
         status = f"[ERROR] Model not loaded: {_INFERENCE_ERR}"
         return (empty_fig("Model unavailable."),
                 html.Div(status, style={"color": RED}),
-                html.Div(status, style={"color": RED}), status)
+                html.Div(status, style={"color": RED}), status,
+                active_status_style)
 
     # Run a fresh inference cycle (writes a new RiskAssessment).
     current = None
@@ -442,7 +471,9 @@ def update_dashboard(selection, n_clicks):
 
     fig = trajectory_figure(points, current) if points \
         else empty_fig("No RiskAssessments available yet.")
-    return fig, abcdef_panel(compliance), sidebar_panel(current), status
+    status_style = active_status_style if status else base_status_style
+    return (fig, abcdef_panel(compliance), sidebar_panel(current),
+            status, status_style)
 
 
 @app.callback(
