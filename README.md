@@ -226,7 +226,7 @@ python3.9 -m venv .venv
 source .venv/bin/activate
 pip install torch==2.8.0 numpy pandas scikit-learn plotly dash flask \
             requests pyarrow tqdm xgboost
-docker run -d --name neuroflow-fhir -p 8080:8080 hapiproject/hapi:latest
+cd fhir-server && docker-compose up -d && cd ..
 python scripts/verify_setup.py   # 51 checks, 0 failures expected
 ```
 
