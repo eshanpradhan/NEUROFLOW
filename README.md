@@ -33,6 +33,12 @@ A nurse opens her hospital dashboard inside the existing EHR. The NEUROFLOW pane
 
 Under the hood: SMART-on-FHIR EHR launch receives patient and encounter context via real OAuth2 token exchange. The app queries FHIR R4 for Observation, MedicationAdministration, Encounter, and Patient resources. A 56,065-parameter Temporal Convolutional Network runs inference on the 40-channel, 63-hour synchronized time-series. A RiskAssessment resource with calibrated conformal prediction intervals is written back to FHIR via deterministic UUIDv5 idempotent PUT. If risk exceeds threshold, a US Core CarePlan with six discrete ABCDEF activities is generated and compliance is scored from existing Observations. Dashboard refreshes every hour. Every prediction is encounter-scoped, patient-bound, timestamped, and auditable.
 
+## Screenshots
+
+| Landing | Full Dashboard | ABCDEF Compliance |
+|---------|---------------|-------------------|
+| ![Landing](demo/01_dashboard_landing.png) | ![Dashboard](demo/03_dashboard_full.png) | ![ABCDEF](demo/04_abcdef_compliance.png) |
+
 ---
 
 ## Results
