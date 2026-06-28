@@ -39,6 +39,10 @@ Under the hood: SMART-on-FHIR EHR launch receives patient and encounter context 
 |---------|---------------|-------------------|
 | ![Landing](demo/01_dashboard_landing.png) | ![Dashboard](demo/03_dashboard_full.png) | ![ABCDEF](demo/04_abcdef_compliance.png) |
 
+## Demo
+
+[▶ Watch full demo — SMART-on-FHIR EHR launch → OAuth2 → patient picker → dashboard → ABCDEF compliance](demo/neuroflow-demo.mov)
+
 ---
 
 ## Results
