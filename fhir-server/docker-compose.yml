@@ -1,0 +1,10 @@
+version: "3.8"
+services:
+  hapi-fhir:
+    image: hapiproject/hapi:latest
+    container_name: neuroflow-fhir
+    ports:
+      - "8080:8080"
+    environment:
+      - hapi.fhir.fhir_version=R4
+    restart: unless-stopped
