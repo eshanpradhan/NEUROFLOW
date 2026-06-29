@@ -113,6 +113,16 @@ NEUROFLOW connects AI risk prediction to the proven ABCDEF intervention protocol
 
 **Calibration:** Isotonic regression fit on chronological last 10% of training split (6,600 stays). Brier 0.1768 → 0.1330.
 
+## Data Handling
+
+**Missing data:** ICU vitals are irregularly charted. NEUROFLOW handles missingness explicitly rather than naively:
+- Pre-observation hours (before the first real reading): backward-filled from the first observed value
+- Post-observation gaps: forward-filled from the last observed value  
+- Fully-missing vitals (zero observations across entire stay): filled with clinically neutral defaults (heart rate 80, temperature 98.6°F, RASS −0.79, GCS 14) — never zero or lower-bound extremes
+- Every vital has a `{vital}_mask` channel (1 = not observed that hour) and `{vital}_hours_since` channel (hours since last real observation, 63 as sentinel before first observation) — the model always knows what data is real vs. imputed
+
+**Data integrity:** Two confirmed pipeline bugs were found and fixed during development: (1) blood pressure was being read from invasive-only arterial line data in eICU, fixed by adding non-invasive BP from vitalAperiodic; (2) fully-missing vitals were being assigned lower-bound extremes via numpy clip, fixed with clinically neutral defaults. Fifteen diagnostic checks confirmed the remaining eICU gap reflects genuine domain shift, not fixable pipeline defects.
+
 ---
 
 ## FHIR Implementation
